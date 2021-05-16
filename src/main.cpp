@@ -24,7 +24,7 @@ const char* mqttPassword 	= SECRET_MQTT_PASSWORD;
 AESLib aesLib;
 
 byte aes_iv[16]    = { 0x17, 0x99, 0x6d, 0x09, 0x3d, 0x28, 0xdd, 0xb3, 0xba, 0x69, 0x5a, 0x2e, 0x6f, 0x58, 0x56, 0x2e };
-byte aes_key[16]   = { 0x37, 0x37, 0x37, 0x39, 0x33, 0x38, 0x44, 0x39, 0x30, 0x46, 0x37, 0x30, 0x34, 0x45, 0x35, 0x42  };
+byte aes_key[16]   = { 0x37, 0x37, 0x37, 0x39, 0x33, 0x38, 0x44, 0x39, 0x30, 0x46, 0x37, 0x30, 0x34, 0x45, 0x35, 0x42 };
 byte enc_iv_to[16] = {};
 byte cleartext[16] = {};
 
@@ -178,7 +178,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
       sprintf(ch, "%02X", enc_iv_to[i]);
       strcat (aes_send, ch);
     }
-    // Вариант "в лоб", без изспользования цикла
+    // Вариант "в лоб", без использования цикла
     //sprintf(aes_send, "%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X", enc_iv_to[0], enc_iv_to[1],enc_iv_to[2],enc_iv_to[3],enc_iv_to[4],enc_iv_to[5],enc_iv_to[6], enc_iv_to[7], enc_iv_to[8],enc_iv_to[9],enc_iv_to[10],enc_iv_to[11],enc_iv_to[12],enc_iv_to[13],enc_iv_to[14],enc_iv_to[15]);
 
     if(strcmp(buff_p, "ON")==0) {
