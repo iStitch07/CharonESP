@@ -78,12 +78,21 @@ WiFiUDP uUdp;
 WiFiClient espClient;
 PubSubClient client(espClient);
 
+char hostname[]      = "charon";
+
+char mqtt_topic_status_base[] = "esp/status/";
+char mqtt_topic_data_base[] = "esp/sensors/co2/";
+
+char mqtt_topic_status[sizeof(mqtt_topic_status_base) + sizeof(hostname) + 5];
+char mqtt_topic_data[sizeof(mqtt_topic_data_base) + sizeof(hostname) + 5];
+
+StaticJsonDocument<200> co2_data_doc;
+
 boolean mqtt_reconnect() {
   Serial.print("Connecting to MQTT...");
-  if(client.connect("charon", mqttUser, mqttPassword, "esp/status/charon", 2, true, "disconnected")) {
-    Serial.println("connected");
+  if(client.connect(hostname, mqttUser, mqttPassword, mqtt_topic_status, 2, true, "offline")) {
     // Online Message
-    client.publish("esp/status/charon", "online", true);
+    client.publish(mqtt_topic_status, "online", true);
     client.subscribe("esp/04cf8cf2ee25/CMD");
     client.subscribe("esp/04cf8cf2ee25/heartbeat");
   } else {
@@ -94,7 +103,7 @@ boolean mqtt_reconnect() {
 
 boolean wifi_reconnect() {
   Serial.printf("Connecting to %s ", ssid);
-  WiFi.hostname("charonESP");
+  WiFi.hostname(hostname);
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
 
@@ -103,15 +112,13 @@ boolean wifi_reconnect() {
     delay(500);
   }
 
-  Serial.printf("\nConnected to the WiFi network: %s\n", ssid);
+  co2_data_doc["IP"] = WiFi.localIP().toString();
 
   mUdp.beginMulticast(WiFi.localIP(), multicast_ip_addr, multicast_port);
   uUdp.begin(unicast_port);
 
-  Serial.printf("Now listening at IP %s, multicst UDP port %d, local UDP port: %d\n", WiFi.localIP().toString().c_str(), multicast_port, unicast_port);
-
   ArduinoOTA.setPort(8266);
-  ArduinoOTA.setHostname("charonESP");
+  ArduinoOTA.setHostname(hostname);
   // ArduinoOTA.setPassword("admin");
 
   ArduinoOTA.onStart([]() {
@@ -267,39 +274,23 @@ boolean co2_measure() {
   if (!s8_co2_mean2) s8_co2_mean2 = s8_co2;
   s8_co2_mean2 = s8_co2_mean2 - smoothing_factor2*(s8_co2_mean2 - s8_co2);
 
-  // Serial.printf("CO2 value: %d, M1Value: %d, M2Value: %d\n", s8_co2, s8_co2_mean, s8_co2_mean2);
+  co2_data_doc["current"] = s8_co2;
+  co2_data_doc["mean"] = s8_co2_mean;
+  co2_data_doc["mean2"] = s8_co2_mean2;
 
-  char buf[8];
-  itoa(s8_co2, buf, 10);
-  client.publish("esp/sensors/charon_co2/current", buf);
-
-  itoa(s8_co2_mean, buf, 10);
-  client.publish("esp/sensors/charon_co2/mean", buf);
-
-  itoa(s8_co2_mean2, buf, 10);
-  client.publish("esp/sensors/charon_co2/mean2", buf);
   return true;
 }
 
 void get_abc() {
   int abc_s8_time;
-  char buf[8];
-  
   s8Request(abc_s8);
   abc_s8_time = s8Replay(response_s8);
-
-  itoa(abc_s8_time, buf, 10);
-  Serial.printf("Auto calibration of S8-0053 set to %s hours\n", buf);
-  client.publish("esp/sensors/charon_co2/stat/abc_hours", buf, true);
+  co2_data_doc["abc"] = abc_s8_time;
   return;
 }
 
 void setup() {
   Serial.begin(115200);
-  Serial.println();
-  Serial.println("==================================== USING CHARON BRANCH ====================================");
-  Serial.println();
-
   if(WiFi.status() != WL_CONNECTED) {
     wifi_reconnect();
   }
@@ -307,6 +298,12 @@ void setup() {
   client.setServer(mqttServer, mqttPort);
   client.setCallback(callback);
   mqtt_reconnect();
+  strcpy(mqtt_topic_status, mqtt_topic_status_base);
+  strcat(mqtt_topic_status, hostname);
+
+  strcpy(mqtt_topic_data, mqtt_topic_data_base);
+  strcat(mqtt_topic_data, hostname);
+
   get_abc();
 }
 
@@ -333,6 +330,10 @@ void loop() {
   long co2_time = millis();
   if(co2_time - lastCo2Measured > CO2_INTERVAL) {
     co2_measure();
+    char buffer[256];
+    memset(buffer, 0, sizeof(buffer));
+    size_t n = serializeJson(co2_data_doc, buffer);
+    client.publish(mqtt_topic_data, buffer, n);
     lastCo2Measured = co2_time;
   }
 
