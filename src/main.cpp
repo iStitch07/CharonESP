@@ -42,21 +42,39 @@ char aes_send[32] = "";
 
 SoftwareSerial s8Serial(D7, D8);
 
-int s8_co2;
-int s8_co2_mean;
-int s8_co2_mean2;
+int co2 = 0;
+int co2_mean = 0;
+int co2_mean2 = 0;
+int abc_time = 0;
+int s8_status = 0;
 
 float smoothing_factor = 0.5;
 float smoothing_factor2 = 0.15;
 
-byte cmd_s8[]       = {0xFE, 0x04, 0x00, 0x03, 0x00, 0x01, 0xD5, 0xC5};
-byte abc_s8[]       = {0xFE, 0x03, 0x00, 0x1F, 0x00, 0x01, 0xA1, 0xC3};
-byte response_s8[7] = {0, 0, 0, 0, 0, 0, 0};
+byte get_co2_cmd[]      = { 0xFE, 0x04, 0x00, 0x03, 0x00, 0x01, 0xD5, 0xC5 }; // Get CO2 value from sensor
+byte get_abc_cmd[]      = { 0xFE, 0x03, 0x00, 0x1F, 0x00, 0x01, 0xA1, 0xC3 }; // Get Auto Baseline Calibration time
+byte get_stat_cmd[]     = { 0xFE, 0x04, 0x00, 0x00, 0x00, 0x01, 0x25, 0xC5 }; // Get sensor status (see: http://www.co2meters.com/Documentation/Datasheets/DS-S8-3.2.pdf for all codes)
+byte get_co2_stat_cmd[] = { 0xFE, 0x04, 0x00, 0x00, 0x00, 0x04, 0xE5, 0xC6 }; // Get CO2 and sensor status in one replay
+byte set_abc_off[]      = { 0xFE, 0x06, 0x00, 0x1F, 0x00, 0x00, 0xAC, 0x03 }; // Turn off abc
+byte set_abc_on[]       = { 0xFE, 0x06, 0x00, 0x1F, 0x00, 0xB4, 0xAC, 0x74 }; // Turn on abc and set time to 180 hours
+
+#define GET_CO2_RLEN 7
+#define GET_STATUS_RLEN 7
+#define GET_TWO_RLEN 13
+#define GET_ABC_RLEN 7
+#define SET_ABC_RLEN 8
+#define BG_CALIBRATION_RLEN 8
+
+#define GET_CO2_FLAG 1
+#define GET_ABC_FLAG 2
+#define GET_TWO_FLAG 3
+#define SET_ABC_FLAG 4
+#define BG_CALIBRATION_FLAG 8 
+
+long lastCo2Measured = 0;
 
 const int r_len = 7;
 const int c_len = 8;
-
-long lastCo2Measured = 0;
 
 // ==============================================================================
 // End S8 init zone
@@ -80,13 +98,11 @@ PubSubClient client(espClient);
 
 char hostname[]      = "charon";
 
-char mqtt_topic_status_base[] = "esp/status/";
-char mqtt_topic_data_base[] = "esp/sensors/co2/";
+char mqtt_topic_status[]  = "esp/status/charon";
+char mqtt_topic_data[]    = "esp/sensors/co2/charon";
+char mqtt_topic_set[]     = "esp/set/charon";
 
-char mqtt_topic_status[sizeof(mqtt_topic_status_base) + sizeof(hostname) + 5];
-char mqtt_topic_data[sizeof(mqtt_topic_data_base) + sizeof(hostname) + 5];
-
-StaticJsonDocument<200> co2_data_doc;
+StaticJsonDocument<200> jdoc;
 
 boolean mqtt_reconnect() {
   Serial.print("Connecting to MQTT...");
@@ -95,6 +111,7 @@ boolean mqtt_reconnect() {
     client.publish(mqtt_topic_status, "online", true);
     client.subscribe("esp/04cf8cf2ee25/CMD");
     client.subscribe("esp/04cf8cf2ee25/heartbeat");
+    client.subscribe(mqtt_topic_set);
   } else {
     Serial.printf("failed with state: %d\n", client.state());
   }
@@ -112,7 +129,7 @@ boolean wifi_reconnect() {
     delay(500);
   }
 
-  co2_data_doc["IP"] = WiFi.localIP().toString();
+  jdoc["IP"] = WiFi.localIP().toString();
 
   mUdp.beginMulticast(WiFi.localIP(), multicast_ip_addr, multicast_port);
   uUdp.begin(unicast_port);
@@ -170,7 +187,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
   }
   buff_p[length] = '\0';
 
-  if (strcmp(topic,"esp/04cf8cf2ee25/CMD")==0){
+  if (strcmp(topic,"esp/04cf8cf2ee25/CMD") == 0) {
     // Сперва получить ключ, вне зависимости от содержания
     memset(aes_send, 0, sizeof(aes_send));
     sprintf((char*)cleartext, "%s", readbuffer);
@@ -225,7 +242,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
       Serial.println();
     }
   }
-  if (strcmp(topic,"esp/04cf8cf2ee25/heartbeat")==0){
+  if (strcmp(topic,"esp/04cf8cf2ee25/heartbeat") == 0) {
     memset(readbuffer, 0, sizeof(readbuffer));
     StaticJsonDocument<256> doc;
     deserializeJson(doc, payload, length);
@@ -233,14 +250,17 @@ void callback(char* topic, byte* payload, unsigned int length) {
   }
 }
 
-void s8Request(byte cmd[]) { 
+bool s8Request(byte cmd[], int8_t response_lenght, int8_t rFlag) {
   s8Serial.begin(9600);
+  byte response[response_lenght];
+
   while(!s8Serial.available()) {
-    s8Serial.write(cmd, c_len); 
+    s8Serial.write(cmd, 8);
     delay(50);
   }
+
   int timeout=0;
-  while(s8Serial.available() < r_len ) {
+  while(s8Serial.available() < response_lenght ) {
     timeout++;
     if(timeout > 10) {
       while(s8Serial.available()) {
@@ -250,43 +270,82 @@ void s8Request(byte cmd[]) {
     } 
     delay(50); 
   } 
-  for (int i=0; i < r_len; i++) { 
-    response_s8[i] = s8Serial.read(); 
+  for (int i=0; i < response_lenght; i++) { 
+    response[i] = s8Serial.read();
   }
-  
   s8Serial.end();
+
+  if(rFlag == GET_CO2_FLAG) {
+    co2 = 0;
+    int high = response[3];
+    int low  = response[4];
+    co2 = high*256 + low;
+
+    if (!co2_mean) co2_mean = co2;
+      co2_mean = co2_mean - smoothing_factor*(co2_mean - co2);
+  
+    if (!co2_mean2) co2_mean2 = co2;
+      co2_mean2 = co2_mean2 - smoothing_factor2*(co2_mean2 - co2);
+
+    jdoc["current"] = co2;
+    jdoc["mean"] = co2_mean;
+    jdoc["mean2"] = co2_mean2;
+
+  }
+
+  if(rFlag == GET_ABC_FLAG) {
+    abc_time = 0;
+    int high = response[3];
+    int low  = response[4];
+    abc_time = high*256 + low;
+    jdoc["abc"] = abc_time;
+  }
+
+  if(rFlag == SET_ABC_FLAG) {
+    if(memcmp(cmd, response, sizeof(response)) == 0) {
+      return true;
+    } 
+    else {
+      return false;
+    }
+  }
+
+  if(rFlag == GET_TWO_FLAG) {
+    int stat_high = response[4];
+    //int stat_low  = response[5];
+    int co2_high  = response[9];
+    int co2_low   = response[10];
+
+    s8_status = 0;
+    co2 = 0;
+
+    s8_status = stat_high;
+    co2 = co2_high*256 + co2_low;
+
+    if (!co2_mean) co2_mean = co2;
+      co2_mean = co2_mean - smoothing_factor*(co2_mean - co2);
+  
+    if (!co2_mean2) co2_mean2 = co2;
+      co2_mean2 = co2_mean2 - smoothing_factor2*(co2_mean2 - co2);
+
+    jdoc["current"] = co2;
+    jdoc["mean"] = co2_mean;
+    jdoc["mean2"] = co2_mean2;
+    jdoc["status"] = s8_status;
+
+  }
+  return true;
 }    
 
-unsigned long s8Replay(byte rc_data[]) { 
-  int high = rc_data[3];
-  int low = rc_data[4];
-  unsigned long val = high*256 + low;
-  return val; 
-}
+void bg_calibration() {
+  byte step_one[] = { 0xFE, 0x06, 0x00, 0x00, 0x00, 0x00, 0x9D, 0xC5 };
+  byte step_two[] = { 0xFE, 0x06, 0x00, 0x01, 0x7C, 0x06, 0x6C, 0xC7 };
 
-boolean co2_measure() {
-  s8Request(cmd_s8);
-  s8_co2 = s8Replay(response_s8);
-  
-  if (!s8_co2_mean) s8_co2_mean = s8_co2;
-  s8_co2_mean = s8_co2_mean - smoothing_factor*(s8_co2_mean - s8_co2);
-  
-  if (!s8_co2_mean2) s8_co2_mean2 = s8_co2;
-  s8_co2_mean2 = s8_co2_mean2 - smoothing_factor2*(s8_co2_mean2 - s8_co2);
+  s8Request(step_one, BG_CALIBRATION_RLEN, BG_CALIBRATION_FLAG);
+  delay(2000);
+  s8Request(step_two, BG_CALIBRATION_RLEN, BG_CALIBRATION_FLAG);
+  delay(3000);
 
-  co2_data_doc["current"] = s8_co2;
-  co2_data_doc["mean"] = s8_co2_mean;
-  co2_data_doc["mean2"] = s8_co2_mean2;
-
-  return true;
-}
-
-void get_abc() {
-  int abc_s8_time;
-  s8Request(abc_s8);
-  abc_s8_time = s8Replay(response_s8);
-  co2_data_doc["abc"] = abc_s8_time;
-  return;
 }
 
 void setup() {
@@ -298,13 +357,8 @@ void setup() {
   client.setServer(mqttServer, mqttPort);
   client.setCallback(callback);
   mqtt_reconnect();
-  strcpy(mqtt_topic_status, mqtt_topic_status_base);
-  strcat(mqtt_topic_status, hostname);
 
-  strcpy(mqtt_topic_data, mqtt_topic_data_base);
-  strcat(mqtt_topic_data, hostname);
-
-  get_abc();
+  s8Request(get_abc_cmd, GET_ABC_RLEN, GET_ABC_FLAG);
 }
 
 void loop() {
@@ -329,10 +383,10 @@ void loop() {
 
   long co2_time = millis();
   if(co2_time - lastCo2Measured > CO2_INTERVAL) {
-    co2_measure();
+    s8Request(get_co2_stat_cmd, GET_TWO_RLEN, GET_TWO_FLAG);
     char buffer[256];
     memset(buffer, 0, sizeof(buffer));
-    size_t n = serializeJson(co2_data_doc, buffer);
+    size_t n = serializeJson(jdoc, buffer);
     client.publish(mqtt_topic_data, buffer, n);
     lastCo2Measured = co2_time;
   }
@@ -352,16 +406,27 @@ void loop() {
     DynamicJsonDocument doc(capacity);
     deserializeJson(doc, jsonPacket);
 
-    char topic[50] = "esp/";
-    strcat (topic, doc["sid"].as<char*>());
-    strcat (topic, "/");
-    strcat (topic, doc["cmd"].as<char*>());
-
+    char topic[100] = "esp/";
     char SID[25];
-    strcpy(SID, doc["sid"].as<char*>());
+    char CMD[25];
+    char DATA[200];
 
-    // Serial.printf("UDP packet [%d bytes] contents: %s\n", mPkSize, mPacket);
+    strlcpy(SID, doc["sid"] | "default", sizeof(SID));
+    strlcpy(CMD, doc["cmd"] | "default", sizeof(CMD));
+    strlcpy(DATA, doc["data"] | "default", sizeof(DATA));
+
+    strcat (topic, SID);
+    strcat (topic, "/");
+    strcat (topic, CMD);
+
     client.publish(topic, mPacket, true);
+
+    if(strcmp(CMD, "report") == 0 ) {
+      char stat_topic[100] = "esp/";
+      strcat(stat_topic, SID);
+      strcat(stat_topic, "/status");
+      client.publish(stat_topic,  DATA, true);
+    }
 
     // Request status
     char ack_data[50] = "{\"cmd\":\"read\",\"sid\":\"";
@@ -386,18 +451,6 @@ void loop() {
       strcat (topic, SID);
       strcat (topic, "/read_ack");
       client.publish(topic, uPacket);
-
-      char ujsonPacket[255];
-      strcpy(ujsonPacket, uPacket);
-      const size_t ucapacity = JSON_OBJECT_SIZE(3) + JSON_ARRAY_SIZE(2) + 60;
-      DynamicJsonDocument udoc(ucapacity);
-      deserializeJson(udoc, ujsonPacket);
-      memset(topic, 0, sizeof(topic));
-      strcat (topic, "esp/");
-      strcat (topic, SID);
-      strcat (topic, "/status");
-      client.publish(topic,  udoc["data"], true);
     }
   }
-
 }
