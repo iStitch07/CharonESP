@@ -7,30 +7,17 @@
 #include <SoftwareSerial.h>
 #include <ArduinoOTA.h>
 #include <AESLib.h>
+#include <ESPAsyncWebServer.h>
+#include <WebSerial.h>
 
 #include <arduino_secrets.h>
 
-const char* ssid 		      = SECRET_SMARTHOME_WIFI_SSID;
-const char* password 		  = SECRET_SMARTHOME_WIFI_PASSWORD;
+const char* ssid 		      = SECRET_GENERAL_WIFI_SSID;
+const char* password 		  = SECRET_GENERAL_WIFI_PASSWORD;
 const char* mqttServer	  = SECRET_MQTT_SERVER;
 const int   mqttPort 		  = SECRET_MQTT_PORT;
 const char* mqttUser 		  = SECRET_MQTT_USER;
 const char* mqttPassword 	= SECRET_MQTT_PASSWORD;
-
-// ==============================================================================
-// AES CBC
-// ==============================================================================
-
-AESLib aesLib;
-
-byte aes_iv[16]    = { 0x17, 0x99, 0x6d, 0x09, 0x3d, 0x28, 0xdd, 0xb3, 0xba, 0x69, 0x5a, 0x2e, 0x6f, 0x58, 0x56, 0x2e };
-byte aes_key[16]   = { 0x37, 0x37, 0x37, 0x39, 0x33, 0x38, 0x44, 0x39, 0x30, 0x46, 0x37, 0x30, 0x34, 0x45, 0x35, 0x42 };
-byte enc_iv_to[16] = {};
-byte cleartext[16] = {};
-
-char readbuffer[] = "vcT9bEapirfUZNyq";
-unsigned char encoded[sizeof(readbuffer) * 2] = "";
-char aes_send[32] = "";
 
 // ==============================================================================
 // S8 Init zone
@@ -80,18 +67,7 @@ const int c_len = 8;
 // End S8 init zone
 // ==============================================================================
 
-unsigned int multicast_port = 9898;
-unsigned int unicast_port   = 8989;
-
 long lastReconnectAttempt = 0;
-
-IPAddress multicast_ip_addr = IPAddress(224, 0, 0, 50);
-
-char mPacket[255];
-char uPacket[255];
-
-WiFiUDP mUdp;
-WiFiUDP uUdp;
 
 WiFiClient espClient;
 PubSubClient client(espClient);
@@ -107,10 +83,7 @@ StaticJsonDocument<200> jdoc;
 boolean mqtt_reconnect() {
   Serial.print("Connecting to MQTT...");
   if(client.connect(hostname, mqttUser, mqttPassword, mqtt_topic_status, 2, true, "offline")) {
-    // Online Message
     client.publish(mqtt_topic_status, "online", true);
-    client.subscribe("esp/04cf8cf2ee25/CMD");
-    client.subscribe("esp/04cf8cf2ee25/heartbeat");
     client.subscribe(mqtt_topic_set);
   } else {
     Serial.printf("failed with state: %d\n", client.state());
@@ -130,9 +103,6 @@ boolean wifi_reconnect() {
   }
 
   jdoc["IP"] = WiFi.localIP().toString();
-
-  mUdp.beginMulticast(WiFi.localIP(), multicast_ip_addr, multicast_port);
-  uUdp.begin(unicast_port);
 
   ArduinoOTA.setPort(8266);
   ArduinoOTA.setHostname(hostname);
@@ -173,82 +143,6 @@ boolean wifi_reconnect() {
   return true;
 }
 
-void encrypt_to_ciphertext(char * msg, uint16_t msgLen, byte iv[]) {
-  aesLib.encrypt((byte*)msg, msgLen, (char*)encoded, aes_key, sizeof(aes_key), iv);
-  return;
-}
-
-void callback(char* topic, byte* payload, unsigned int length) {
-  char buff_p[length];
-
-  for (size_t i = 0; i < length; i++)
-  {
-    buff_p[i] = (char)payload[i];
-  }
-  buff_p[length] = '\0';
-
-  if (strcmp(topic,"esp/04cf8cf2ee25/CMD") == 0) {
-    // Сперва получить ключ, вне зависимости от содержания
-    memset(aes_send, 0, sizeof(aes_send));
-    sprintf((char*)cleartext, "%s", readbuffer);
-    memcpy(enc_iv_to, aes_iv, sizeof(aes_iv));
-    uint16_t msgLen = sizeof(cleartext);
-    encrypt_to_ciphertext((char*)cleartext, msgLen, enc_iv_to);
-
-    for (size_t i = 0; i < sizeof(enc_iv_to); i++)
-    {
-      char ch[sizeof(enc_iv_to[i])] = "";
-      memset(ch, 0, sizeof(ch));
-      sprintf(ch, "%02X", enc_iv_to[i]);
-      strcat (aes_send, ch);
-    }
-    // Вариант "в лоб", без использования цикла
-    //sprintf(aes_send, "%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X", enc_iv_to[0], enc_iv_to[1],enc_iv_to[2],enc_iv_to[3],enc_iv_to[4],enc_iv_to[5],enc_iv_to[6], enc_iv_to[7], enc_iv_to[8],enc_iv_to[9],enc_iv_to[10],enc_iv_to[11],enc_iv_to[12],enc_iv_to[13],enc_iv_to[14],enc_iv_to[15]);
-
-    if(strcmp(buff_p, "ON")==0) {
-      char udpPayload[150] = "{\"cmd\":\"write\",\"model\":\"gateway\",\"sid\":\"4cf8cf2ee25\",\"data\":\"{\"key\":\"";
-      strcat(udpPayload, aes_send); 
-      strcat(udpPayload, "\",\"rgb\":838795264}\"}");
-
-      IPAddress gIP(192, 168, 2, 9);
-      uUdp.beginPacket(gIP, multicast_port);
-      uUdp.write(udpPayload);
-      uUdp.endPacket();
-
-      memset(udpPayload, 0, sizeof(udpPayload));
-      strcat(udpPayload, "{\"cmd\":\"read\",\"sid\":\"4cf8cf2ee25\"}");
-      uUdp.beginPacket(gIP, multicast_port);
-      uUdp.write(udpPayload);
-      uUdp.endPacket();
-
-    } else if (strcmp(buff_p, "OFF")==0) {
-      char udpPayload[150] = "{\"cmd\":\"write\",\"model\":\"gateway\",\"sid\":\"4cf8cf2ee25\",\"data\":\"{\"key\":\"";
-      strcat(udpPayload, aes_send); 
-      strcat(udpPayload, "\",\"rgb\":0}\"}");
-
-      IPAddress gIP(192, 168, 2, 9);
-      uUdp.beginPacket(gIP, multicast_port);
-      uUdp.write(udpPayload);
-      uUdp.endPacket();
-
-      memset(udpPayload, 0, sizeof(udpPayload));
-      strcat(udpPayload, "{\"cmd\":\"read\",\"sid\":\"4cf8cf2ee25\"}");
-      uUdp.beginPacket(gIP, multicast_port);
-      uUdp.write(udpPayload);
-      uUdp.endPacket();
-
-    } else {
-      Serial.print("UNKNOWN CMD");
-      Serial.println();
-    }
-  }
-  if (strcmp(topic,"esp/04cf8cf2ee25/heartbeat") == 0) {
-    memset(readbuffer, 0, sizeof(readbuffer));
-    StaticJsonDocument<256> doc;
-    deserializeJson(doc, payload, length);
-    strlcpy(readbuffer, doc["token"] | "default", sizeof(readbuffer));
-  }
-}
 
 bool s8Request(byte cmd[], int8_t response_lenght, int8_t rFlag) {
   s8Serial.begin(9600);
@@ -348,6 +242,20 @@ void bg_calibration() {
 
 }
 
+void callback(char* topic, byte* payload, unsigned int length) {
+  char buff_p[length];
+
+  for (size_t i = 0; i < length; i++)
+  {
+    buff_p[i] = (char)payload[i];
+  }
+  buff_p[length] = '\0';
+
+  if(strcmp(buff_p, "calibrate") == 0) {
+    bg_calibration();
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   if(WiFi.status() != WL_CONNECTED) {
@@ -389,68 +297,5 @@ void loop() {
     size_t n = serializeJson(jdoc, buffer);
     client.publish(mqtt_topic_data, buffer, n);
     lastCo2Measured = co2_time;
-  }
-
-  int mPkSize = mUdp.parsePacket();
-  //unsigned int pub_status = 0;
-  if (mPkSize) {
-    int len = mUdp.read(mPacket, 255);
-    if (len > 0) {
-      mPacket[len] = 0;
-    }
-
-    char jsonPacket[255];
-    strcpy(jsonPacket, mPacket);
-
-    const size_t capacity = JSON_OBJECT_SIZE(3) + JSON_ARRAY_SIZE(2) + 60;
-    DynamicJsonDocument doc(capacity);
-    deserializeJson(doc, jsonPacket);
-
-    char topic[100] = "esp/";
-    char SID[25];
-    char CMD[25];
-    char DATA[200];
-
-    strlcpy(SID, doc["sid"] | "default", sizeof(SID));
-    strlcpy(CMD, doc["cmd"] | "default", sizeof(CMD));
-    strlcpy(DATA, doc["data"] | "default", sizeof(DATA));
-
-    strcat (topic, SID);
-    strcat (topic, "/");
-    strcat (topic, CMD);
-
-    client.publish(topic, mPacket, true);
-
-    if(strcmp(CMD, "report") == 0 ) {
-      char stat_topic[100] = "esp/";
-      strcat(stat_topic, SID);
-      strcat(stat_topic, "/status");
-      client.publish(stat_topic,  DATA, true);
-    }
-
-    // Request status
-    char ack_data[50] = "{\"cmd\":\"read\",\"sid\":\"";
-    strcat(ack_data, SID);
-    strcat(ack_data, "\"}");
-    
-    uUdp.beginPacket(mUdp.remoteIP(), multicast_port);
-    uUdp.write(ack_data);
-    uUdp.endPacket();
-
-    // Read answer
-    int uPkSize = uUdp.parsePacket();
-    if (uPkSize) {
-      len = uUdp.read(uPacket, 255);
-      if (len > 0) {
-        uPacket[len] = 0;
-      }
-    }
-
-    if(uUdp.remoteIP() == mUdp.remoteIP()) {
-      char topic[50] = "esp/";
-      strcat (topic, SID);
-      strcat (topic, "/read_ack");
-      client.publish(topic, uPacket);
-    }
   }
 }
